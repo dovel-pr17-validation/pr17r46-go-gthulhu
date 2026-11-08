@@ -1,0 +1,11 @@
+.vscode
+libbpf
+bpftool
+output
+*.ll
+*.o
+*.skeleton.h
+main
+libwrapper.a
+gthulhu-cli
+monitor/bpf/vmlinux.h

@@ -1,0 +1,62 @@
+name: Deploy Demo to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'api/web/**'
+      - '.github/workflows/deploy-pages.yml'
+  workflow_dispatch:
+
+# Allow only one deployment at a time
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    name: Deploy to gh-pages branch
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: api/web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: api/web
+        run: npm ci
+
+      - name: Build React frontend (mock mode for GitHub Pages demo)
+        working-directory: api/web
+        run: npm run build
+        env:
+          # Subpath under which the site is served on GitHub Pages
+          # (https://<owner>.github.io/Gthulhu/). Trailing slash required.
+          VITE_BASE: /${{ github.event.repository.name }}/
+          # Enable the MSW-based mock API so the demo works without a backend.
+          VITE_USE_MOCK: 'true'
+
+      - name: Deploy to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./api/web/dist
+          publish_branch: gh-pages
+          user_name: 'github-actions[bot]'
+          user_email: 'github-actions[bot]@users.noreply.github.com'
+          commit_message: 'deploy: update Gthulhu API demo'
+          force_orphan: false
+          enable_jekyll: false
+          cname: ''

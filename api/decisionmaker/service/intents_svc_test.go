@@ -1,0 +1,296 @@
+package service
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+
+	"github.com/Gthulhu/api/decisionmaker/domain"
+	"github.com/Gthulhu/api/pkg/util"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestTraverseIntentMerkleTreeNilRequest(t *testing.T) {
+	svc := &Service{}
+
+	resp, err := svc.TraverseIntentMerkleTree(context.Background(), nil)
+	require.Error(t, err)
+	assert.Nil(t, resp)
+}
+
+func TestTraverseIntentMerkleTreeDepthZero(t *testing.T) {
+	root := util.BuildMerkleTree([]string{
+		util.HashStringSHA256Hex("leaf-a"),
+		util.HashStringSHA256Hex("leaf-b"),
+	})
+	svc := &Service{intentMerkleRoot: root}
+
+	resp, err := svc.TraverseIntentMerkleTree(context.Background(), &TraverseIntentMerkleTreeOptions{
+		Depth: 0,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.RootNode)
+	assert.Equal(t, root.Hash, resp.RootNode.Hash)
+	assert.Nil(t, resp.RootNode.Left)
+	assert.Nil(t, resp.RootNode.Right)
+}
+
+func TestTraverseIntentMerkleTreeFindSubTreeByRootHash(t *testing.T) {
+	root := util.BuildMerkleTree([]string{
+		util.HashStringSHA256Hex("leaf-a"),
+		util.HashStringSHA256Hex("leaf-b"),
+		util.HashStringSHA256Hex("leaf-c"),
+		util.HashStringSHA256Hex("leaf-d"),
+	})
+	require.NotNil(t, root)
+	require.NotNil(t, root.Left)
+	require.NotNil(t, root.Right)
+
+	svc := &Service{intentMerkleRoot: root}
+	resp, err := svc.TraverseIntentMerkleTree(context.Background(), &TraverseIntentMerkleTreeOptions{
+		RootHash: root.Left.Hash,
+		Depth:    1,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.RootNode)
+	assert.Equal(t, root.Left.Hash, resp.RootNode.Hash)
+	require.NotNil(t, resp.RootNode.Left)
+	require.NotNil(t, resp.RootNode.Right)
+	assert.Nil(t, resp.RootNode.Left.Left)
+	assert.Nil(t, resp.RootNode.Left.Right)
+	assert.Nil(t, resp.RootNode.Right.Left)
+	assert.Nil(t, resp.RootNode.Right.Right)
+}
+
+func TestTraverseIntentMerkleTreeRootHashNotFound(t *testing.T) {
+	svc := &Service{
+		intentMerkleRoot: util.BuildMerkleTree([]string{
+			util.HashStringSHA256Hex("leaf-a"),
+			util.HashStringSHA256Hex("leaf-b"),
+		}),
+	}
+
+	resp, err := svc.TraverseIntentMerkleTree(context.Background(), &TraverseIntentMerkleTreeOptions{
+		RootHash: "missing-hash",
+		Depth:    0,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.Nil(t, resp.RootNode)
+}
+
+func TestTraverseIntentMerkleTreeRefreshesRootFromIntentCache(t *testing.T) {
+	intentA := &domain.Intent{
+		PodName:       "pod-a",
+		PodID:         "pod-id-a",
+		NodeID:        "node-a",
+		K8sNamespace:  "default",
+		CommandRegex:  "nginx",
+		Priority:      1,
+		ExecutionTime: 100,
+		PodLabels: map[string]string{
+			"z": "2",
+			"a": "1",
+		},
+	}
+	intentB := &domain.Intent{
+		PodName:       "pod-b",
+		PodID:         "pod-id-b",
+		NodeID:        "node-b",
+		K8sNamespace:  "kube-system",
+		CommandRegex:  "busybox",
+		Priority:      0,
+		ExecutionTime: 200,
+		PodLabels: map[string]string{
+			"k2": "v2",
+		},
+	}
+	svc := &Service{
+		intentCache: []*domain.Intent{
+			nil, // ensure nil input is normalized away
+			intentB,
+			intentA,
+		},
+	}
+
+	resp, err := svc.TraverseIntentMerkleTree(context.Background(), &TraverseIntentMerkleTreeOptions{
+		Depth: 0,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.RootNode)
+	require.NotNil(t, svc.intentMerkleRoot)
+	assert.Equal(t, svc.intentMerkleRoot.Hash, resp.RootNode.Hash)
+	assert.Equal(t, svc.intentMerkleRoot.Hash, svc.intentMerkleRootHash)
+}
+
+func TestHashIntentLabelOrderIndependent(t *testing.T) {
+	intentA := &domain.Intent{
+		PodName:       "pod",
+		PodID:         "pod-id",
+		NodeID:        "node-id",
+		K8sNamespace:  "default",
+		CommandRegex:  "nginx",
+		Priority:      1,
+		ExecutionTime: 42,
+		PodLabels: map[string]string{
+			"b": "2",
+			"a": "1",
+		},
+	}
+	intentB := &domain.Intent{
+		PodName:       "pod",
+		PodID:         "pod-id",
+		NodeID:        "node-id",
+		K8sNamespace:  "default",
+		CommandRegex:  "nginx",
+		Priority:      1,
+		ExecutionTime: 42,
+		PodLabels: map[string]string{
+			"a": "1",
+			"b": "2",
+		},
+	}
+
+	hashA := hashIntent(intentA)
+	hashB := hashIntent(intentB)
+	assert.Equal(t, hashA, hashB)
+	assert.Equal(t, util.HashStringSHA256Hex("podName=pod|podID=pod-id|nodeID=node-id|k8sNamespace=default|commandRegex=nginx|priority=1|executionTime=42|podLabels=a=1,b=2"), hashA)
+}
+
+func TestResolveSchedulingIntentsEnforcesCommandRegex(t *testing.T) {
+	svc := &Service{
+		schedulingIntentsMap: util.NewGenericMap[string, []*domain.SchedulingIntents](),
+	}
+	intents := []*domain.Intent{{
+		PodID:        "pod-id",
+		CommandRegex: `^python3$`,
+	}}
+	podInfos := map[string]*domain.PodInfo{
+		"pod-id": {
+			Processes: []domain.PodProcess{
+				{PID: 101, Command: "python3"},
+				{PID: 102, Command: "sh"},
+			},
+		},
+	}
+
+	got := svc.resolveSchedulingIntents(context.Background(), intents, podInfos)
+
+	require.Len(t, got, 1)
+	assert.Equal(t, 101, got[0].PID)
+}
+
+func TestResolveSchedulingIntentsRejectsInvalidCommandRegex(t *testing.T) {
+	svc := &Service{
+		schedulingIntentsMap: util.NewGenericMap[string, []*domain.SchedulingIntents](),
+	}
+	intents := []*domain.Intent{{
+		PodID:        "pod-id",
+		CommandRegex: "(",
+	}}
+	podInfos := map[string]*domain.PodInfo{
+		"pod-id": {
+			Processes: []domain.PodProcess{{PID: 101, Command: "python3"}},
+		},
+	}
+
+	assert.Empty(t, svc.resolveSchedulingIntents(context.Background(), intents, podInfos))
+}
+
+func TestTraverseIntentMerkleTreeConcurrentReadWrite(t *testing.T) {
+	svc := &Service{
+		intentMerkleRoot: util.BuildMerkleTree([]string{util.HashStringSHA256Hex("initial")}),
+	}
+
+	const workers = 4
+	const iterations = 200
+
+	errCh := make(chan error, workers*iterations)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			root := util.BuildMerkleTree([]string{util.HashStringSHA256Hex(fmt.Sprintf("leaf-%d", i))})
+			svc.intentCacheMu.Lock()
+			svc.intentMerkleRoot = root
+			svc.intentCacheMu.Unlock()
+		}
+	}()
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				resp, err := svc.TraverseIntentMerkleTree(context.Background(), &TraverseIntentMerkleTreeOptions{Depth: 0})
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if resp == nil || resp.RootNode == nil || resp.RootNode.Hash == "" {
+					errCh <- fmt.Errorf("unexpected nil/empty root node: %+v", resp)
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		require.NoError(t, err)
+	}
+}
+
+func TestDeleteIntentByPodIDClearsCachedIntentAndMetricTarget(t *testing.T) {
+	svc := &Service{
+		schedulingIntentsMap: util.NewGenericMap[string, []*domain.SchedulingIntents](),
+		podSchedCollector:    NewPodSchedMetricCollector("node-a"),
+		intentCache: []*domain.Intent{
+			{PodID: "pod-a"},
+			{PodID: "pod-b"},
+		},
+	}
+	svc.schedulingIntentsMap.Store("pod-a-101", []*domain.SchedulingIntents{{PID: 101}})
+	svc.schedulingIntentsMap.Store("pod-b-202", []*domain.SchedulingIntents{{PID: 202}})
+	svc.podSchedCollector.intentPods = []podTarget{
+		{PodUID: "pod-a", PIDs: []int{101}},
+		{PodUID: "pod-b", PIDs: []int{202}},
+	}
+
+	require.NoError(t, svc.DeleteIntentByPodID(context.Background(), "pod-a"))
+
+	require.Len(t, svc.intentCache, 1)
+	assert.Equal(t, "pod-b", svc.intentCache[0].PodID)
+	_, exists := svc.schedulingIntentsMap.Load("pod-a-101")
+	assert.False(t, exists)
+	_, exists = svc.schedulingIntentsMap.Load("pod-b-202")
+	assert.True(t, exists)
+	require.Len(t, svc.podSchedCollector.intentPods, 1)
+	assert.Equal(t, "pod-b", svc.podSchedCollector.intentPods[0].PodUID)
+}
+
+func TestDeleteAllIntentsClearsCachedIntentsAndMetricTargets(t *testing.T) {
+	svc := &Service{
+		schedulingIntentsMap: util.NewGenericMap[string, []*domain.SchedulingIntents](),
+		podSchedCollector:    NewPodSchedMetricCollector("node-a"),
+		intentCache:          []*domain.Intent{{PodID: "pod-a"}},
+	}
+	svc.schedulingIntentsMap.Store("pod-a-101", []*domain.SchedulingIntents{{PID: 101}})
+	svc.podSchedCollector.intentPods = []podTarget{{PodUID: "pod-a", PIDs: []int{101}}}
+
+	require.NoError(t, svc.DeleteAllIntents(context.Background()))
+
+	assert.Empty(t, svc.intentCache)
+	_, exists := svc.schedulingIntentsMap.Load("pod-a-101")
+	assert.False(t, exists)
+	assert.Empty(t, svc.podSchedCollector.intentPods)
+	assert.Equal(t, util.HashStringSHA256Hex(""), svc.intentMerkleRootHash)
+}

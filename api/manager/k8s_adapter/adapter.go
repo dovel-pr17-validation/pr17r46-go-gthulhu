@@ -1,0 +1,611 @@
+package k8sadapter
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/Gthulhu/api/manager/domain"
+	"github.com/Gthulhu/api/pkg/logger"
+	apiv1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/clientcmd"
+)
+
+var _ domain.K8SAdapter = (*Adapter)(nil)
+
+type Options struct {
+	KubeConfigPath string
+	InCluster      bool
+}
+
+type Adapter struct {
+	client         kubernetes.Interface
+	dynamicClient  dynamic.Interface
+	podCache       map[string]apiv1.Pod
+	podCacheMu     sync.RWMutex
+	stopCh         chan struct{}
+	startWatcher   sync.Once
+	stopWatcher    sync.Once
+	cacheHasSynced atomic.Bool
+}
+
+func NewAdapter(opt Options) (*Adapter, error) {
+	config, err := buildConfig(opt)
+	if err != nil {
+		return nil, err
+	}
+
+	config.Timeout = 10 * time.Second
+	config.QPS = 20
+	config.Burst = 50
+
+	client, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("create kubernetes client: %w", err)
+	}
+
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("create kubernetes dynamic client: %w", err)
+	}
+
+	adapter := &Adapter{
+		client:        client,
+		dynamicClient: dynamicClient,
+		podCache:      make(map[string]apiv1.Pod),
+		stopCh:        make(chan struct{}),
+	}
+	adapter.startPodWatcher()
+
+	return adapter, nil
+}
+
+func buildConfig(opt Options) (*rest.Config, error) {
+	if opt.InCluster {
+		cfg, err := rest.InClusterConfig()
+		if err != nil {
+			return nil, fmt.Errorf("build in-cluster config: %w", err)
+		}
+		return cfg, nil
+	}
+
+	if opt.KubeConfigPath == "" {
+		return nil, domain.ErrNoKubeConfig
+	}
+
+	cfg, err := clientcmd.BuildConfigFromFlags("", opt.KubeConfigPath)
+	if err != nil {
+		return nil, fmt.Errorf("build kubeconfig from %s: %w", opt.KubeConfigPath, err)
+	}
+
+	return cfg, nil
+}
+
+func (a *Adapter) startPodWatcher() {
+	a.startWatcher.Do(func() {
+		informerFactory := informers.NewSharedInformerFactory(a.client, 0)
+		podInformer := informerFactory.Core().V1().Pods().Informer()
+
+		podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				pod, ok := obj.(*apiv1.Pod)
+				if !ok {
+					return
+				}
+				logger.Logger(context.Background()).Debug().Msgf("pod added: %s/%s", pod.Namespace, pod.Name)
+				a.setPodCache(*pod)
+			},
+			UpdateFunc: func(_, newObj interface{}) {
+				pod, ok := newObj.(*apiv1.Pod)
+				if !ok {
+					return
+				}
+				logger.Logger(context.Background()).Debug().Msgf("pod updated: %s/%s", pod.Namespace, pod.Name)
+				a.setPodCache(*pod)
+			},
+			DeleteFunc: func(obj interface{}) {
+				switch pod := obj.(type) {
+				case *apiv1.Pod:
+					logger.Logger(context.Background()).Debug().Msgf("pod deleted: %s/%s", pod.Namespace, pod.Name)
+					a.deletePodCache(string(pod.UID))
+				case cache.DeletedFinalStateUnknown:
+					if p, ok := pod.Obj.(*apiv1.Pod); ok {
+						a.deletePodCache(string(p.UID))
+					}
+				}
+			},
+		})
+
+		informerFactory.Start(a.stopCh)
+
+		synced := cache.WaitForCacheSync(a.stopCh, podInformer.HasSynced)
+		a.cacheHasSynced.Store(synced)
+		logger.Logger(context.Background()).Info().Msg("starting k8s pod watcher")
+	})
+}
+
+func (a *Adapter) StopPodWatcher() {
+	a.stopWatcher.Do(func() {
+		if a.stopCh != nil {
+			close(a.stopCh)
+		}
+	})
+}
+
+func (a *Adapter) QueryPods(ctx context.Context, opt *domain.QueryPodsOptions) ([]*domain.Pod, error) {
+	if opt == nil {
+		return nil, domain.ErrNilQueryInput
+	}
+	if a == nil || a.client == nil {
+		return nil, domain.ErrNoClient
+	}
+
+	labelSelector := buildLabelSelector(opt.LabelSelectors)
+	namespaces := opt.K8SNamespace
+	if len(namespaces) == 0 {
+		namespaces = []string{metav1.NamespaceAll}
+	}
+
+	pods, err := a.listPods(ctx, namespaces, labelSelector)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]*domain.Pod, 0, len(pods))
+
+	for _, pod := range pods {
+		podLabels := copyLabels(pod.Labels)
+		result := &domain.Pod{
+			Name:         pod.Name,
+			K8SNamespace: pod.Namespace,
+			Labels:       podLabels,
+			PodID:        string(pod.UID),
+			NodeID:       pod.Spec.NodeName,
+			Containers:   buildContainers(pod),
+		}
+		results = append(results, result)
+	}
+
+	return results, nil
+}
+
+func (a *Adapter) QueryDecisionMakerPods(ctx context.Context, opt *domain.QueryDecisionMakerPodsOptions) ([]*domain.DecisionMakerPod, error) {
+	if opt == nil {
+		return nil, domain.ErrNilQueryInput
+	}
+
+	if a == nil || a.client == nil {
+		return nil, domain.ErrNoClient
+	}
+
+	labelSelector := buildLabelSelector([]domain.LabelSelector{opt.DecisionMakerLabel})
+	namespaces := opt.K8SNamespace
+	if len(namespaces) == 0 {
+		namespaces = []string{metav1.NamespaceAll}
+	}
+
+	nodeFilters := make(map[string]struct{}, len(opt.NodeIDs))
+	for _, id := range opt.NodeIDs {
+		nodeFilters[id] = struct{}{}
+	}
+
+	pods, err := a.listPods(ctx, namespaces, labelSelector)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]*domain.DecisionMakerPod, 0, len(pods))
+	for _, pod := range pods {
+		if len(nodeFilters) > 0 {
+			if _, ok := nodeFilters[pod.Spec.NodeName]; !ok {
+				continue
+			}
+		}
+
+		host := pod.Status.PodIP
+		if host == "" {
+			host = pod.Status.HostIP
+		}
+
+		results = append(results, &domain.DecisionMakerPod{
+			NodeID: pod.Spec.NodeName,
+			Port:   firstContainerPort(pod),
+			Host:   host,
+			State:  mapPodState(pod.Status.Phase),
+		})
+	}
+
+	return results, nil
+}
+
+func (a *Adapter) listPods(ctx context.Context, namespaces []string, labelSelector string) ([]apiv1.Pod, error) {
+	selector, err := labels.Parse(labelSelector)
+	if err != nil {
+		return nil, fmt.Errorf("parse label selector %q: %w", labelSelector, err)
+	}
+
+	if a.cacheHasSynced.Load() {
+		return a.podsFromCache(namespaces, selector), nil
+	}
+
+	return a.listPodsLive(ctx, namespaces, labelSelector)
+}
+
+func (a *Adapter) podsFromCache(namespaces []string, selector labels.Selector) []apiv1.Pod {
+	nsAll := len(namespaces) == 0 || (len(namespaces) == 1 && namespaces[0] == metav1.NamespaceAll)
+	nsSet := make(map[string]struct{}, len(namespaces))
+	for _, ns := range namespaces {
+		nsSet[ns] = struct{}{}
+	}
+
+	a.podCacheMu.RLock()
+	defer a.podCacheMu.RUnlock()
+
+	pods := make([]apiv1.Pod, 0, len(a.podCache))
+	for _, pod := range a.podCache {
+		if !nsAll {
+			if _, ok := nsSet[pod.Namespace]; !ok {
+				continue
+			}
+		}
+		if selector.String() != "" && !selector.Matches(labels.Set(pod.Labels)) {
+			continue
+		}
+		pods = append(pods, pod)
+	}
+	return pods
+}
+
+func (a *Adapter) listPodsLive(ctx context.Context, namespaces []string, labelSelector string) ([]apiv1.Pod, error) {
+	results := make([]apiv1.Pod, 0)
+	for _, ns := range namespaces {
+		pods, err := a.client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{
+			LabelSelector: labelSelector,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("list pods in namespace %s: %w", ns, err)
+		}
+		for _, pod := range pods.Items {
+			a.setPodCache(pod)
+			results = append(results, pod)
+		}
+	}
+	return results, nil
+}
+
+func (a *Adapter) setPodCache(pod apiv1.Pod) {
+	a.podCacheMu.Lock()
+	a.podCache[string(pod.UID)] = pod
+	a.podCacheMu.Unlock()
+}
+
+func (a *Adapter) deletePodCache(uid string) {
+	a.podCacheMu.Lock()
+	delete(a.podCache, uid)
+	a.podCacheMu.Unlock()
+}
+
+func buildLabelSelector(selectors []domain.LabelSelector) string {
+	labels := make([]string, 0, len(selectors))
+	for _, selector := range selectors {
+		if selector.Key == "" {
+			continue
+		}
+		if selector.Value == "" {
+			labels = append(labels, selector.Key)
+			continue
+		}
+		labels = append(labels, fmt.Sprintf("%s=%s", selector.Key, selector.Value))
+	}
+	return strings.Join(labels, ",")
+}
+
+func buildContainers(pod apiv1.Pod) []domain.Container {
+	statusByName := make(map[string]string, len(pod.Status.ContainerStatuses))
+	for _, status := range pod.Status.ContainerStatuses {
+		statusByName[status.Name] = status.ContainerID
+	}
+
+	result := make([]domain.Container, 0, len(pod.Spec.Containers))
+	for _, container := range pod.Spec.Containers {
+		command := append([]string{}, container.Command...)
+		command = append(command, container.Args...)
+
+		result = append(result, domain.Container{
+			ContainerID: statusByName[container.Name],
+			Name:        container.Name,
+			Command:     command,
+		})
+	}
+	return result
+}
+
+func copyLabels(labels map[string]string) map[string]string {
+	if len(labels) == 0 {
+		return nil
+	}
+
+	cloned := make(map[string]string, len(labels))
+	for k, v := range labels {
+		cloned[k] = v
+	}
+	return cloned
+}
+
+// decisionMakerPortNames lists the container port names (in priority order)
+// that identify the decision maker (sidecar) API endpoint.
+var decisionMakerPortNames = []string{"http", "api", "sidecar", "dm", "decisionmaker"}
+
+// excludedPortNames lists container port names that must never be treated as
+// the decision maker API port (e.g. Prometheus scrape endpoint).
+var excludedPortNames = map[string]struct{}{
+	"monitor-metrics": {},
+	"metrics":         {},
+	"prometheus":      {},
+}
+
+// firstContainerPort returns the decision maker API port for the pod.
+//
+// A scheduler pod can carry multiple containers (e.g. the scheduler itself
+// plus a sidecar) each exposing different ports. The previous implementation
+// blindly returned the first port of the first container, which on monitoring
+// enabled deployments resolved to the Prometheus scrape port (9090) instead
+// of the sidecar API port. We now scan all containers and:
+//  1. prefer ports whose name matches a known decision maker port name;
+//  2. otherwise return the first port whose name is not in the exclusion list;
+//  3. finally fall back to the very first port found (legacy behaviour).
+func firstContainerPort(pod apiv1.Pod) int {
+	var fallback int32
+	var nonExcluded int32
+	for _, container := range pod.Spec.Containers {
+		for _, port := range container.Ports {
+			if fallback == 0 {
+				fallback = port.ContainerPort
+			}
+			if _, skip := excludedPortNames[port.Name]; skip {
+				continue
+			}
+			for _, preferred := range decisionMakerPortNames {
+				if port.Name == preferred {
+					return int(port.ContainerPort)
+				}
+			}
+			if nonExcluded == 0 {
+				nonExcluded = port.ContainerPort
+			}
+		}
+	}
+	if nonExcluded != 0 {
+		return int(nonExcluded)
+	}
+	return int(fallback)
+}
+
+func mapPodState(phase apiv1.PodPhase) domain.NodeState {
+	switch phase {
+	case apiv1.PodRunning:
+		return domain.NodeStateOnline
+	case apiv1.PodPending:
+		return domain.NodeStateUnknown
+	default:
+		return domain.NodeStateOffline
+	}
+}
+
+// ListNodes returns all nodes in the Kubernetes cluster
+func (a *Adapter) ListNodes(ctx context.Context) ([]*domain.Node, error) {
+	if a == nil || a.client == nil {
+		return nil, domain.ErrNoClient
+	}
+
+	nodeList, err := a.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list nodes: %w", err)
+	}
+
+	results := make([]*domain.Node, 0, len(nodeList.Items))
+	for i := range nodeList.Items {
+		results = append(results, nodeToDomain(&nodeList.Items[i]))
+	}
+
+	return results, nil
+}
+
+func nodeToDomain(node *apiv1.Node) *domain.Node {
+	status := "Unknown"
+	for _, condition := range node.Status.Conditions {
+		if condition.Type == apiv1.NodeReady {
+			if condition.Status == apiv1.ConditionTrue {
+				status = "Ready"
+			} else {
+				status = "NotReady"
+			}
+			break
+		}
+	}
+
+	return &domain.Node{
+		Name:   node.Name,
+		Labels: copyLabels(node.Labels),
+		Status: status,
+	}
+}
+
+// QueryNodesBySelectors returns nodes matching the given label selectors
+// AND (if non-empty) whose name is present in NodeNames. Either selector
+// type may be omitted to match on the other alone.
+func (a *Adapter) QueryNodesBySelectors(ctx context.Context, opt *domain.QueryNodesOptions) ([]*domain.Node, error) {
+	if opt == nil {
+		return nil, domain.ErrNilQueryInput
+	}
+	if a == nil || a.client == nil {
+		return nil, domain.ErrNoClient
+	}
+
+	labelSelector := buildLabelSelector(opt.NodeSelectors)
+	nodeList, err := a.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{LabelSelector: labelSelector})
+	if err != nil {
+		return nil, fmt.Errorf("list nodes: %w", err)
+	}
+
+	nameFilter := make(map[string]struct{}, len(opt.NodeNames))
+	for _, name := range opt.NodeNames {
+		nameFilter[name] = struct{}{}
+	}
+
+	results := make([]*domain.Node, 0, len(nodeList.Items))
+	for i := range nodeList.Items {
+		node := &nodeList.Items[i]
+		if len(nameFilter) > 0 {
+			if _, ok := nameFilter[node.Name]; !ok {
+				continue
+			}
+		}
+		results = append(results, nodeToDomain(node))
+	}
+
+	return results, nil
+}
+
+// resourceSliceGVR is the DRA (Dynamic Resource Allocation) ResourceSlice
+// GroupVersionResource. ResourceSlices are published by DRA drivers and
+// advertise which devices are available on which node.
+var resourceSliceGVR = schema.GroupVersionResource{
+	Group:    "resource.k8s.io",
+	Version:  "v1alpha3",
+	Resource: "resourceslices",
+}
+
+// QueryNodesByDRA returns the set of nodes that expose a device matching at
+// least one of the given DRASelectors (device class + optional attribute
+// key/value pairs), as published via resource.k8s.io ResourceSlice objects.
+func (a *Adapter) QueryNodesByDRA(ctx context.Context, opt *domain.QueryNodesByDRAOptions) ([]*domain.Node, error) {
+	if opt == nil {
+		return nil, domain.ErrNilQueryInput
+	}
+	if a == nil || a.dynamicClient == nil {
+		return nil, domain.ErrNoClient
+	}
+	if len(opt.DRASelectors) == 0 {
+		return nil, nil
+	}
+
+	list, err := a.dynamicClient.Resource(resourceSliceGVR).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list resource slices: %w", err)
+	}
+
+	matchedNodeNames := make(map[string]struct{})
+	for i := range list.Items {
+		slice := &list.Items[i]
+		for _, selector := range opt.DRASelectors {
+			if resourceSliceMatchesSelector(slice, selector) {
+				if nodeName := getUnstructuredStr(slice.Object, "spec", "nodeName"); nodeName != "" {
+					matchedNodeNames[nodeName] = struct{}{}
+				}
+				break
+			}
+		}
+	}
+
+	if len(matchedNodeNames) == 0 {
+		return nil, nil
+	}
+
+	nodeList, err := a.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list nodes: %w", err)
+	}
+	results := make([]*domain.Node, 0, len(matchedNodeNames))
+	for i := range nodeList.Items {
+		node := &nodeList.Items[i]
+		if _, ok := matchedNodeNames[node.Name]; ok {
+			results = append(results, nodeToDomain(node))
+		}
+	}
+	return results, nil
+}
+
+// resourceSliceMatchesSelector reports whether the ResourceSlice matches the
+// given DRASelector's device class (spec.driver) and, if provided, every
+// requested attribute key/value pair on at least one device in the slice.
+func resourceSliceMatchesSelector(slice *unstructured.Unstructured, selector domain.DRASelector) bool {
+	if selector.DeviceClass != "" {
+		driver := getUnstructuredStr(slice.Object, "spec", "driver")
+		if driver != selector.DeviceClass {
+			return false
+		}
+	}
+	if len(selector.Attributes) == 0 {
+		return true
+	}
+
+	devices, found, err := unstructured.NestedSlice(slice.Object, "spec", "devices")
+	if err != nil || !found {
+		return false
+	}
+	for _, d := range devices {
+		device, ok := d.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		attrs, found, err := unstructured.NestedMap(device, "basic", "attributes")
+		if err != nil || !found {
+			continue
+		}
+		if deviceAttributesMatch(attrs, selector.Attributes) {
+			return true
+		}
+	}
+	return false
+}
+
+func deviceAttributesMatch(attrs map[string]interface{}, wanted []domain.LabelSelector) bool {
+	for _, sel := range wanted {
+		raw, ok := attrs[sel.Key]
+		if !ok {
+			return false
+		}
+		if sel.Value == "" {
+			continue
+		}
+		if attributeValueToString(raw) != sel.Value {
+			return false
+		}
+	}
+	return true
+}
+
+// attributeValueToString stringifies a DRA device attribute value. Attribute
+// values are encoded as a map with exactly one of "string"/"int"/"bool"/
+// "version" set, per the resource.k8s.io DeviceAttribute schema.
+func attributeValueToString(raw interface{}) string {
+	m, ok := raw.(map[string]interface{})
+	if !ok {
+		return fmt.Sprintf("%v", raw)
+	}
+	for _, key := range []string{"string", "int", "bool", "version"} {
+		if v, ok := m[key]; ok {
+			return fmt.Sprintf("%v", v)
+		}
+	}
+	return ""
+}
+
+func getUnstructuredStr(obj map[string]interface{}, fields ...string) string {
+	v, found, err := unstructured.NestedString(obj, fields...)
+	if err != nil || !found {
+		return ""
+	}
+	return v
+}

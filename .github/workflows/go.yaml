@@ -1,0 +1,183 @@
+name: Go
+on:
+  push:
+    branches:
+      - develop
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+      - develop
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  analyze-code:
+    name: Analyze Code
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Dependencies
+        uses: ./.github/actions/build-dependencies
+      - name: Lint
+        run: |
+          if test -z "$(gofmt -l .)"; then
+            echo "Congrats! There is nothing to fix."
+          else
+            echo "The following lines should be fixed."
+            gofmt -s -d .
+            exit 1
+          fi
+        shell: bash
+      - name: Lint (vet)
+        run: |
+          make dep
+          git submodule init
+          git submodule sync
+          git submodule update
+          cd scx
+          cargo build --release -p scx_rustland
+          cd ..
+          cd libbpfgo
+          make
+          cd ..
+          make lint
+        shell: bash
+  self-tests:
+    name: Selftests
+    runs-on: ubuntu-24.04
+    if: (github.event_name == 'pull_request' || github.event_name == 'push') && (github.ref_name == 'develop' || github.ref_name == 'main' || startsWith(github.ref, 'refs/tags/v'))
+    strategy:
+      matrix:
+        go-version: [ 'stable' ]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Dependencies
+        uses: ./.github/actions/build-dependencies
+        with:
+          go-version: ${{ matrix.go-version }}
+      - name: Static Selftests
+        run: |
+          make dep
+          git submodule init
+          git submodule sync
+          git submodule update
+          cd scx
+          cargo build --release -p scx_rustland
+          cd ..
+          cd libbpfgo
+          make
+          cd ..
+          make build
+          make test
+        shell: bash
+  schtest-tests:
+    name: Schtest Integration Tests
+    runs-on: ubuntu-24.04
+    if: (github.event_name == 'pull_request' || github.event_name == 'push') && (github.ref_name == 'develop' || github.ref_name == 'main' || startsWith(github.ref, 'refs/tags/v'))
+    strategy:
+      matrix:
+        go-version: [ 'stable' ]
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+      - name: Install Dependencies
+        uses: ./.github/actions/build-dependencies
+        with:
+          go-version: ${{ matrix.go-version }}
+      - name: Build Gthulhu
+        run: |
+          make dep
+          git submodule init
+          git submodule sync
+          git submodule update
+          cd scx
+          cargo build --release -p scx_rustland
+          cd ..
+          cd libbpfgo
+          make
+          cd ..
+          make build
+        shell: bash
+      - name: Run Schtest Tests
+        run: |
+          make schtest KERNEL_VERSION=6.12
+        shell: bash
+        continue-on-error: true
+  build-and-push-image:
+    name: Build and Push Container Image
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'pull_request'
+    needs: [analyze-code, self-tests, schtest-tests]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: recursive
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+      - name: Normalize image name
+        id: image
+        run: echo "repo_lc=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+        shell: bash
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8d19755c6f78e81 # v5.5.1
+        with:
+          images: ghcr.io/${{ steps.image.outputs.repo_lc }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Build and push Docker image
+        id: build_base
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Extract metadata for Dockerfile.scx image
+        id: meta_scx
+        uses: docker/metadata-action@8e5442c4ef9f78752691e2d8f8d19755c6f78e81 # v5.5.1
+        with:
+          images: ghcr.io/${{ steps.image.outputs.repo_lc }}-scx
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Dockerfile.scx image
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          file: ./Dockerfile.scx
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            BASE_IMAGE=ghcr.io/${{ steps.image.outputs.repo_lc }}@${{ steps.build_base.outputs.digest }}
+          tags: ${{ steps.meta_scx.outputs.tags }}
+          labels: ${{ steps.meta_scx.outputs.labels }}

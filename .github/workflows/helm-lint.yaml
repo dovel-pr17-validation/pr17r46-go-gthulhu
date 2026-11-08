@@ -1,0 +1,42 @@
+name: Helm Lint
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'chart/gthulhu/**'
+      - '.github/workflows/helm-lint.yaml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'chart/gthulhu/**'
+      - '.github/workflows/helm-lint.yaml'
+
+jobs:
+  helm-lint:
+    name: Lint Helm Chart
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: v3.13.0
+
+      - name: Lint Helm chart with default values
+        run: |
+          helm lint chart/gthulhu
+
+      - name: Lint Helm chart with production values
+        run: |
+          helm lint chart/gthulhu -f chart/gthulhu/values-production.yaml
+
+      - name: Test Helm template rendering with default values
+        run: |
+          helm template gthulhu chart/gthulhu --debug
+
+      - name: Test Helm template rendering with production values
+        run: |
+          helm template gthulhu chart/gthulhu -f chart/gthulhu/values-production.yaml --debug

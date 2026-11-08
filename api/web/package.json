@@ -1,0 +1,25 @@
+{
+  "name": "gthulhu-web-ui",
+  "version": "1.0.0",
+  "description": "Gthulhu - eBPF Scheduler Control Interface",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "lucide-react": "^0.574.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^7.18.2"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@vitejs/plugin-react": "^6.0.2",
+    "msw": "^2.13.6",
+    "vite": "^8.3.4"
+  }
+}

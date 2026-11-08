@@ -1,0 +1,659 @@
+package service
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/rsa"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/Gthulhu/api/config"
+	"github.com/Gthulhu/api/decisionmaker/domain"
+	"github.com/Gthulhu/api/pkg/logger"
+	"github.com/Gthulhu/api/pkg/util"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/fx"
+)
+
+type Params struct {
+	fx.In
+	TokenConfig  config.TokenConfig
+	DaemonConfig config.DaemonConfig
+}
+
+func NewService(params Params) (*Service, error) {
+	privateKey, err := util.InitRSAPrivateKey(string(params.TokenConfig.RsaPrivateKeyPem))
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize JWT private key: %v", err)
+	}
+	machineID := util.GetMachineID()
+	svc := &Service{
+		schedulingIntentsMap: util.NewGenericMap[string, []*domain.SchedulingIntents](),
+		metricCollector:      NewMetricCollector(machineID),
+		podSchedCollector:    NewPodSchedMetricCollector(machineID),
+		jwtPrivateKey:        privateKey,
+		daemonEndpoint:       strings.TrimRight(params.DaemonConfig.Endpoint, "/"),
+		daemonHTTPClient: &http.Client{
+			Timeout: time.Duration(max(params.DaemonConfig.TimeoutSec, 5)) * time.Second,
+		},
+		taskSource: NewProcTaskSource(procDir),
+	}
+	if svc.daemonEndpoint == "" {
+		svc.daemonEndpoint = "http://127.0.0.1:18080"
+	}
+
+	err = prometheus.Register(svc.metricCollector)
+	if err != nil {
+		return nil, fmt.Errorf("failed to register metric collector: %v", err)
+	}
+	err = prometheus.Register(svc.podSchedCollector)
+	if err != nil {
+		return nil, fmt.Errorf("failed to register pod sched metric collector: %v", err)
+	}
+	return svc, nil
+}
+
+type Service struct {
+	schedulingIntentsMap *util.GenericMap[string, []*domain.SchedulingIntents]
+	metricCollector      *MetricCollector
+	podSchedCollector    *PodSchedMetricCollector
+	jwtPrivateKey        *rsa.PrivateKey
+	tokenConfig          config.TokenConfig
+	intentCacheMu        sync.RWMutex
+	intentCache          []*domain.Intent
+	intentMerkleRoot     *util.MerkleNode
+	intentMerkleRootHash string
+	runtimeConfigMu      sync.RWMutex
+	runtimeConfig        *domain.RuntimeSchedulerConfig
+	daemonEndpoint       string
+	daemonHTTPClient     *http.Client
+
+	// Node-level scheduling policies (target arbitrary processes on this
+	// node, not just Pod container processes). See node_policy_svc.go.
+	taskSource               TaskSource
+	nodePolicyCacheMu        sync.RWMutex
+	nodePolicyCache          []*domain.NodePolicy
+	nodePolicyMerkleRoot     *util.MerkleNode
+	nodePolicyMerkleRootHash string
+}
+
+const (
+	procDir      = "/proc"
+	pauseCommand = "pause"
+)
+
+// ListAllSchedulingIntents re-scans /proc and recalculates scheduling intents
+// from the cached domain.Intent list, since pod processes may change over time.
+// It also merges in scheduling intents produced by node-level scheduling
+// policies (see node_policy_svc.go), which target arbitrary processes on the
+// node rather than Pod container processes.
+func (svc *Service) ListAllSchedulingIntents(ctx context.Context) ([]*domain.SchedulingIntents, error) {
+	svc.intentCacheMu.RLock()
+	cachedIntents := svc.intentCache
+	svc.intentCacheMu.RUnlock()
+
+	var podSchedulingIntents []*domain.SchedulingIntents
+	if len(cachedIntents) > 0 {
+		podInfos, err := svc.GetAllPodInfos(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		svc.podSchedCollector.UpdatePodTargets(cachedIntents, podInfos)
+		podSchedulingIntents = svc.resolveSchedulingIntents(ctx, cachedIntents, podInfos)
+	} else {
+		svc.podSchedCollector.UpdatePodTargets(nil, nil)
+		svc.schedulingIntentsMap.Clear()
+	}
+
+	nodeSchedulingIntents, err := svc.resolveNodeSchedulingIntents(ctx)
+	if err != nil {
+		// An incomplete node scan must not be published as the full desired
+		// state, or the scheduler would drop strategies for the tasks that
+		// could not be read. Fail the cycle so the consumer keeps its last set.
+		return nil, fmt.Errorf("resolve node scheduling intents: %w", err)
+	}
+
+	if len(nodeSchedulingIntents) == 0 {
+		return podSchedulingIntents, nil
+	}
+	return append(podSchedulingIntents, nodeSchedulingIntents...), nil
+}
+
+// ProcessIntents processes a list of scheduling intents and updates the internal map
+func (svc *Service) ProcessIntents(ctx context.Context, intents []*domain.Intent) error {
+	podInfos, err := svc.GetAllPodInfos(ctx)
+	if err != nil {
+		return err
+	}
+
+	// update intent cache and merkle tree
+	normalizedIntents := normalizeIntentInputs(intents)
+	sortedIntents := sortIntentsByKey(normalizedIntents)
+	leafHashes := make([]string, 0, len(sortedIntents))
+	for _, intent := range sortedIntents {
+		leafHashes = append(leafHashes, hashIntent(intent))
+	}
+	root := util.BuildMerkleTree(leafHashes)
+	svc.intentCacheMu.Lock()
+	svc.intentCache = normalizedIntents
+	svc.intentMerkleRoot = root
+	if root != nil {
+		svc.intentMerkleRootHash = root.Hash
+	} else {
+		svc.intentMerkleRootHash = ""
+	}
+	svc.intentCacheMu.Unlock()
+	svc.resolveSchedulingIntents(ctx, normalizedIntents, podInfos)
+	svc.podSchedCollector.UpdatePodTargets(normalizedIntents, podInfos)
+	logger.Logger(ctx).Info().Msgf("Discovered pods: %+v", podInfos)
+	return nil
+}
+
+// resolveSchedulingIntents converts domain.Intents + PodInfos into SchedulingIntents,
+// updates the schedulingIntentsMap and returns all resolved scheduling intents.
+func (svc *Service) resolveSchedulingIntents(ctx context.Context, intents []*domain.Intent, podInfos map[string]*domain.PodInfo) []*domain.SchedulingIntents {
+	svc.schedulingIntentsMap.Clear()
+	var allSchedulingIntents []*domain.SchedulingIntents
+	for _, intent := range intents {
+		podInfo := podInfos[intent.PodID]
+		logger.Logger(ctx).Info().Msgf("Processing intent for PodName:%s PodID: %s on NodeID: %s, Process:%+v", intent.PodName, intent.PodID, intent.NodeID, podInfo)
+		commandRegex, err := regexp.Compile(intent.CommandRegex)
+		if err != nil {
+			logger.Logger(ctx).Warn().Err(err).Msgf("invalid commandRegex %q for pod %s", intent.CommandRegex, intent.PodID)
+			continue
+		}
+		labels := []domain.LabelSelector{}
+		for key, value := range intent.PodLabels {
+			labels = append(labels, domain.LabelSelector{
+				Key:   key,
+				Value: value,
+			})
+		}
+		if podInfo != nil && len(podInfo.Processes) > 0 {
+			for _, process := range podInfo.Processes {
+				if process.Command == pauseCommand {
+					continue
+				}
+				if !commandRegex.MatchString(process.Command) {
+					continue
+				}
+				schedulingIntent := &domain.SchedulingIntents{
+					Priority:      intent.Priority,
+					ExecutionTime: uint64(intent.ExecutionTime),
+					PID:           process.PID,
+					CommandRegex:  intent.CommandRegex,
+					Selectors:     labels,
+				}
+				logger.Logger(ctx).Info().Msgf("Created SchedulingIntent: %+v for Process PID: %d", schedulingIntent, process.PID)
+				svc.schedulingIntentsMap.Store(fmt.Sprintf("%s-%d", intent.PodID, process.PID), []*domain.SchedulingIntents{schedulingIntent})
+				allSchedulingIntents = append(allSchedulingIntents, schedulingIntent)
+			}
+		}
+	}
+	return allSchedulingIntents
+}
+
+// GetAllPodInfos retrieves all pod information by scanning the /proc filesystem
+func (svc *Service) GetAllPodInfos(ctx context.Context) (map[string]*domain.PodInfo, error) {
+	return svc.FindPodInfoFrom(ctx, procDir)
+}
+
+// FindPodInfoFrom scans the given rootDir (e.g., /proc) to find pod information
+func (svc *Service) FindPodInfoFrom(ctx context.Context, rootDir string) (map[string]*domain.PodInfo, error) {
+	podMap := make(map[string]*domain.PodInfo)
+
+	// Walk through /proc to find all processes
+	entries, err := os.ReadDir(rootDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read /proc directory: %v", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		// Check if directory name is a PID (numeric)
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			// Not a numeric PID directory (e.g., "acpi", "bus", etc.) — skip
+			continue
+		}
+
+		// Read cgroup information for this process
+		cgroupPath := fmt.Sprintf("%s/%d/cgroup", rootDir, pid)
+		file, err := os.Open(cgroupPath)
+		if err != nil {
+			logger.Logger(ctx).Warn().Err(err).Msgf("failed to open cgroup file for pid %d", pid)
+			continue
+		}
+		scanner := bufio.NewScanner(file)
+		for scanner.Scan() {
+			line := scanner.Text()
+			logger.Logger(ctx).Debug().Msgf("cgroup line for pid %d: %s", pid, line)
+			if strings.Contains(line, "kubepods") {
+				err = svc.parseCgroupToPodInfo(rootDir, line, pid, podMap)
+				if err != nil {
+					logger.Logger(ctx).Warn().Err(err).Msgf("failed to parse cgroup line for pid %d, line:%s", pid, line)
+					break
+				}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+		}
+		_ = file.Close()
+	}
+
+	return podMap, nil
+}
+
+// parseCgroupToPodInfo parses a cgroup line (e.g // 0::/kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-pod20da609e_6973_4463_a1f9_2db9bcc5becc.slice/cri-containerd-10ec3c89629f71226b227e6510b2d465168b24005bbdcc5d7940517080830635.scope) to extract pod info and updates the podInfoMap
+func (svc *Service) parseCgroupToPodInfo(rootDir string, line string, pid int, podInfoMap map[string]*domain.PodInfo) error {
+	parts := strings.Split(line, ":")
+	if len(parts) >= 3 {
+		cgroupHierarchy := parts[2]
+
+		// Extract pod information
+		podUID, containerID, err := svc.getPodInfoFromCgroup(cgroupHierarchy)
+		if err != nil {
+			return err
+		}
+
+		// Get process information
+		process, err := svc.getProcessInfo(rootDir, pid)
+		if err != nil {
+			return err
+		}
+		process.ContainerID = containerID
+
+		// Create or update pod info
+		if podInfo, exists := podInfoMap[podUID]; exists {
+			podInfo.Processes = append(podInfo.Processes, process)
+		} else {
+			podInfoMap[podUID] = &domain.PodInfo{
+				PodUID:    podUID,
+				Processes: []domain.PodProcess{process},
+			}
+		}
+	}
+	return nil
+}
+
+// Support multiple cgroup formats:
+// - systemd: kubelet-kubepods-pod20da609e_6973_4463_a1f9_2db9bcc5becc.slice (underscores)
+// - cgroupfs: /kubepods/burstable/pod31e4e721-a5a0-421a-ae1d-b7971ae30d6e/ (dashes)
+var podRegex = regexp.MustCompile(`pod([0-9a-fA-F]{8}[-_][0-9a-fA-F]{4}[-_][0-9a-fA-F]{4}[-_][0-9a-fA-F]{4}[-_][0-9a-fA-F]{12})`)
+
+// getPodInfoFromCgroup extracts pod information from cgroup path
+func (svc *Service) getPodInfoFromCgroup(cgroupPath string) (podUID string, containerID string, err error) {
+	// Parse cgroup path to extract pod information
+	// 0::/kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-pod20da609e_6973_4463_a1f9_2db9bcc5becc.slice/cri-containerd-10ec3c89629f71226b227e6510b2d465168b24005bbdcc5d7940517080830635.scope
+	parts := strings.Split(cgroupPath, "/")
+	for _, part := range parts {
+		if podRegex.MatchString(part) {
+			podUID = podRegex.FindStringSubmatch(part)[1]
+			podUID = strings.ReplaceAll(podUID, "_", "-")
+		}
+		if strings.HasPrefix(part, "cri-containerd-") && strings.HasSuffix(part, ".scope") {
+			containerID = strings.TrimPrefix(part, "cri-containerd-")
+			containerID = strings.TrimSuffix(containerID, ".scope")
+		}
+	}
+
+	if podUID == "" {
+		return "", "", fmt.Errorf("pod UID not found in cgroup path")
+	}
+
+	return podUID, containerID, nil
+}
+
+// getProcessInfo reads process information from /proc/<pid>/
+func (svc *Service) getProcessInfo(rootDir string, pid int) (domain.PodProcess, error) {
+	process := domain.PodProcess{PID: pid}
+
+	// Read command from /proc/<pid>/comm
+	commPath := fmt.Sprintf("/%s/%d/comm", rootDir, pid)
+	if data, err := os.ReadFile(commPath); err == nil {
+		process.Command = strings.TrimSpace(string(data))
+	}
+
+	// Read PPID from /proc/<pid>/stat
+	statPath := fmt.Sprintf("/%s/%d/stat", rootDir, pid)
+	if data, err := os.ReadFile(statPath); err == nil {
+		fields := strings.Fields(string(data))
+		if len(fields) >= 4 {
+			if ppid, err := strconv.Atoi(fields[3]); err == nil {
+				process.PPID = ppid
+			}
+		}
+	}
+
+	return process, nil
+}
+
+func (svc *Service) UpdateMetrics(ctx context.Context, newMetricSet *domain.MetricSet) {
+	svc.metricCollector.UpdateMetrics(newMetricSet)
+}
+
+func normalizeIntentInputs(intents []*domain.Intent) []*domain.Intent {
+	results := make([]*domain.Intent, 0, len(intents))
+	for _, intent := range intents {
+		if intent == nil {
+			continue
+		}
+		results = append(results, intent)
+	}
+	return results
+}
+
+func sortIntentsByKey(intents []*domain.Intent) []*domain.Intent {
+	results := make([]*domain.Intent, 0, len(intents))
+	results = append(results, intents...)
+	sort.Slice(results, func(i, j int) bool {
+		return intentSortKey(results[i]) < intentSortKey(results[j])
+	})
+	return results
+}
+
+func hashIntent(intent *domain.Intent) string {
+	labels := make([]string, 0, len(intent.PodLabels))
+	for key, value := range intent.PodLabels {
+		labels = append(labels, key+"="+value)
+	}
+	sort.Strings(labels)
+	serialized := strings.Join([]string{
+		"podName=" + intent.PodName,
+		"podID=" + intent.PodID,
+		"nodeID=" + intent.NodeID,
+		"k8sNamespace=" + intent.K8sNamespace,
+		"commandRegex=" + intent.CommandRegex,
+		"priority=" + strconv.Itoa(intent.Priority),
+		"executionTime=" + strconv.FormatInt(intent.ExecutionTime, 10),
+		"podLabels=" + strings.Join(labels, ","),
+	}, "|")
+	return util.HashStringSHA256Hex(serialized)
+}
+
+func intentSortKey(intent *domain.Intent) string {
+	labels := make([]string, 0, len(intent.PodLabels))
+	for key, value := range intent.PodLabels {
+		labels = append(labels, key+"="+value)
+	}
+	sort.Strings(labels)
+	return strings.Join([]string{
+		intent.PodName,
+		intent.PodID,
+		intent.NodeID,
+		intent.K8sNamespace,
+		intent.CommandRegex,
+		strconv.Itoa(intent.Priority),
+		strconv.FormatInt(intent.ExecutionTime, 10),
+		strings.Join(labels, ","),
+	}, "|")
+}
+
+func (svc *Service) refreshIntentMerkleTreeIfNeeded() {
+	var hasRoot bool
+
+	svc.intentCacheMu.RLock()
+	{
+		hasRoot = svc.intentMerkleRoot != nil
+	}
+	svc.intentCacheMu.RUnlock()
+
+	if hasRoot {
+		return
+	}
+
+	svc.intentCacheMu.Lock()
+	defer svc.intentCacheMu.Unlock()
+	if svc.intentMerkleRoot != nil {
+		return
+	}
+	normalized := normalizeIntentInputs(svc.intentCache)
+	sorted := sortIntentsByKey(normalized)
+	leafHashes := make([]string, 0, len(sorted))
+	for _, intent := range sorted {
+		leafHashes = append(leafHashes, hashIntent(intent))
+	}
+	root := util.BuildMerkleTree(leafHashes)
+	svc.intentMerkleRoot = root
+	if root != nil {
+		svc.intentMerkleRootHash = root.Hash
+	} else {
+		svc.intentMerkleRootHash = ""
+	}
+}
+
+// DeleteIntentByPodID deletes all scheduling intents for a specific pod ID
+func (svc *Service) DeleteIntentByPodID(ctx context.Context, podID string) error {
+	svc.intentCacheMu.Lock()
+	remaining := make([]*domain.Intent, 0, len(svc.intentCache))
+	for _, intent := range svc.intentCache {
+		if intent != nil && intent.PodID != podID {
+			remaining = append(remaining, intent)
+		}
+	}
+	svc.intentCache = remaining
+	svc.rebuildIntentMerkleTreeLocked()
+	svc.intentCacheMu.Unlock()
+
+	keysToDelete := []string{}
+	svc.schedulingIntentsMap.Range(func(key string, value []*domain.SchedulingIntents) bool {
+		if strings.HasPrefix(key, podID+"-") {
+			keysToDelete = append(keysToDelete, key)
+		}
+		return true
+	})
+	for _, key := range keysToDelete {
+		svc.schedulingIntentsMap.Delete(key)
+	}
+	svc.removePodMetricTarget(podID)
+	logger.Logger(ctx).Info().Msgf("Deleted %d scheduling intents for pod ID: %s", len(keysToDelete), podID)
+	return nil
+}
+
+// DeleteIntentByPID deletes a specific scheduling intent by pod ID and PID
+func (svc *Service) DeleteIntentByPID(ctx context.Context, podID string, pid int) error {
+	key := fmt.Sprintf("%s-%d", podID, pid)
+	svc.schedulingIntentsMap.Delete(key)
+	logger.Logger(ctx).Info().Msgf("Deleted scheduling intent for key: %s", key)
+	return nil
+}
+
+// DeleteAllIntents clears all scheduling intents
+func (svc *Service) DeleteAllIntents(ctx context.Context) error {
+	svc.intentCacheMu.Lock()
+	svc.intentCache = nil
+	svc.rebuildIntentMerkleTreeLocked()
+	svc.intentCacheMu.Unlock()
+
+	keysToDelete := []string{}
+	svc.schedulingIntentsMap.Range(func(key string, value []*domain.SchedulingIntents) bool {
+		keysToDelete = append(keysToDelete, key)
+		return true
+	})
+
+	for _, key := range keysToDelete {
+		svc.schedulingIntentsMap.Delete(key)
+	}
+	svc.podSchedCollector.UpdatePodTargets(nil, nil)
+
+	logger.Logger(ctx).Info().Msgf("Deleted all %d scheduling intents", len(keysToDelete))
+	return nil
+}
+
+func (svc *Service) rebuildIntentMerkleTreeLocked() {
+	sorted := sortIntentsByKey(normalizeIntentInputs(svc.intentCache))
+	leafHashes := make([]string, 0, len(sorted))
+	for _, intent := range sorted {
+		leafHashes = append(leafHashes, hashIntent(intent))
+	}
+	svc.intentMerkleRoot = util.BuildMerkleTree(leafHashes)
+	if svc.intentMerkleRoot == nil {
+		svc.intentMerkleRootHash = ""
+		return
+	}
+	svc.intentMerkleRootHash = svc.intentMerkleRoot.Hash
+}
+
+func (svc *Service) removePodMetricTarget(podID string) {
+	svc.podSchedCollector.mu.Lock()
+	defer svc.podSchedCollector.mu.Unlock()
+	targets := svc.podSchedCollector.intentPods[:0]
+	for _, target := range svc.podSchedCollector.intentPods {
+		if target.PodUID != podID {
+			targets = append(targets, target)
+		}
+	}
+	svc.podSchedCollector.intentPods = targets
+}
+
+func (svc *Service) ApplyRuntimeConfig(ctx context.Context, config domain.RuntimeSchedulerConfig) error {
+	if config.ConfigVersion == "" {
+		return fmt.Errorf("configVersion is required")
+	}
+	config.Normalize()
+	if err := config.Validate(); err != nil {
+		return err
+	}
+
+	endpoint := svc.daemonEndpoint + "/api/v1/runtime-config"
+	body, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("marshal runtime config: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBuffer(body))
+	if err != nil {
+		return fmt.Errorf("create daemon runtime config request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := svc.daemonHTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("call daemon runtime config endpoint: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("daemon runtime config endpoint returned status %s: %s", resp.Status, string(respBody))
+	}
+
+	svc.runtimeConfigMu.Lock()
+	defer svc.runtimeConfigMu.Unlock()
+
+	if svc.runtimeConfig != nil && svc.runtimeConfig.ConfigVersion == config.ConfigVersion {
+		return nil
+	}
+
+	copyConfig := config
+	svc.runtimeConfig = &copyConfig
+	logger.Logger(ctx).Info().Msgf("runtime config applied: version=%s", config.ConfigVersion)
+	return nil
+}
+
+func (svc *Service) GetRuntimeConfigStatus(ctx context.Context) domain.RuntimeConfigStatus {
+	// Try to fetch detailed status from daemon's status endpoint
+	// The daemon now returns actual config values from its runtime YAML
+	endpoint := svc.daemonEndpoint + "/api/v1/status"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err == nil {
+		resp, httpErr := svc.daemonHTTPClient.Do(req)
+		if httpErr == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				var payload struct {
+					Success bool `json:"success"`
+					Data    *struct {
+						ConfigVersion     string `json:"configVersion,omitempty"`
+						Applied           bool   `json:"applied"`
+						AppliedAt         string `json:"appliedAt,omitempty"`
+						RestartCount      int64  `json:"restartCount,omitempty"`
+						LastError         string `json:"lastError,omitempty"`
+						ConfigAvailable   bool   `json:"configAvailable"`
+						Mode              string `json:"mode,omitempty"`
+						SchedulerName     string `json:"schedulerName,omitempty"`
+						SliceNsDefault    uint64 `json:"sliceNsDefault,omitempty"`
+						SliceNsMin        uint64 `json:"sliceNsMin,omitempty"`
+						KernelMode        *bool  `json:"kernelMode,omitempty"`
+						MaxTimeWatchdog   *bool  `json:"maxTimeWatchdog,omitempty"`
+						EarlyProcessing   *bool  `json:"earlyProcessing,omitempty"`
+						BuiltinIdle       *bool  `json:"builtinIdle,omitempty"`
+						SchedulerEnabled  *bool  `json:"schedulerEnabled,omitempty"`
+						MonitoringEnabled *bool  `json:"monitoringEnabled,omitempty"`
+					} `json:"data,omitempty"`
+				}
+				if decodeErr := json.NewDecoder(resp.Body).Decode(&payload); decodeErr == nil && payload.Success && payload.Data != nil {
+					var daemonConfig *domain.RuntimeSchedulerConfig
+					if payload.Data.ConfigAvailable {
+						daemonConfig = &domain.RuntimeSchedulerConfig{
+							ConfigVersion:  payload.Data.ConfigVersion,
+							Mode:           payload.Data.Mode,
+							SchedulerName:  payload.Data.SchedulerName,
+							SliceNsDefault: payload.Data.SliceNsDefault,
+							SliceNsMin:     payload.Data.SliceNsMin,
+						}
+						if payload.Data.KernelMode != nil {
+							daemonConfig.KernelMode = *payload.Data.KernelMode
+						}
+						if payload.Data.MaxTimeWatchdog != nil {
+							daemonConfig.MaxTimeWatchdog = *payload.Data.MaxTimeWatchdog
+						}
+						if payload.Data.EarlyProcessing != nil {
+							daemonConfig.EarlyProcessing = *payload.Data.EarlyProcessing
+						}
+						if payload.Data.BuiltinIdle != nil {
+							daemonConfig.BuiltinIdle = *payload.Data.BuiltinIdle
+						}
+						if payload.Data.SchedulerEnabled != nil {
+							daemonConfig.SchedulerEnabled = *payload.Data.SchedulerEnabled
+						}
+						if payload.Data.MonitoringEnabled != nil {
+							daemonConfig.MonitoringEnabled = *payload.Data.MonitoringEnabled
+						}
+					}
+					return domain.RuntimeConfigStatus{
+						ConfigVersion: payload.Data.ConfigVersion,
+						Applied:       payload.Data.Applied,
+						AppliedAt:     payload.Data.AppliedAt,
+						RestartCount:  payload.Data.RestartCount,
+						LastError:     payload.Data.LastError,
+						Config:        daemonConfig,
+					}
+				}
+			}
+		}
+	}
+
+	// Fallback to locally cached config if daemon is unreachable
+	svc.runtimeConfigMu.RLock()
+	currentConfig := svc.runtimeConfig
+	svc.runtimeConfigMu.RUnlock()
+
+	if currentConfig == nil {
+		return domain.RuntimeConfigStatus{Applied: false}
+	}
+	return domain.RuntimeConfigStatus{
+		ConfigVersion: currentConfig.ConfigVersion,
+		Applied:       true,
+		Config:        currentConfig,
+	}
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
